@@ -22,3 +22,5 @@ wheels/
 /wandb/
 .installed.cfg
 *.egg
+
+.idea/
