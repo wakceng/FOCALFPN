@@ -25,5 +25,5 @@ wheels/
 
 .idea/
 
-/dataset/*
+/datasets/*
 /yolov5/runs/*
