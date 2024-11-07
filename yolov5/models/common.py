@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from torch.cuda import amp
+import torch.nn.functional as F
 
 # Import 'ultralytics' package or install if missing
 try:
@@ -55,6 +56,10 @@ from utils.general import (
     yaml_load,
 )
 from utils.torch_utils import copy_attr, smart_inference_mode
+from utils.activation import act_layers
+from utils.init_weights import constant_init, kaiming_init
+from utils.norm import build_norm_layer
+from timm.layers import DropPath
 
 
 def autopad(k, p=None, d=1):
@@ -1081,3 +1086,399 @@ class Classify(nn.Module):
         if isinstance(x, list):
             x = torch.cat(x, 1)
         return self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
+    
+
+########################################################################################################################
+
+########################################################################################################################
+
+########################################################################################################################
+
+########################################################################################################################
+
+# for focalfpn
+
+class ConvModule(nn.Module):
+    """A conv block that contains conv/norm/activation layers.
+
+    Args:
+        in_channels (int): Same as nn.Conv2d.
+        out_channels (int): Same as nn.Conv2d.
+        kernel_size (int or tuple[int]): Same as nn.Conv2d.
+        stride (int or tuple[int]): Same as nn.Conv2d.
+        padding (int or tuple[int]): Same as nn.Conv2d.
+        dilation (int or tuple[int]): Same as nn.Conv2d.
+        groups (int): Same as nn.Conv2d.
+        bias (bool or str): If specified as `auto`, it will be decided by the
+            norm_cfg. Bias will be set as True if norm_cfg is None, otherwise
+            False.
+        conv_cfg (dict): Config dict for convolution layer.
+        norm_cfg (dict): Config dict for normalization layer.
+        activation (str): activation layer, "ReLU" by default.
+        inplace (bool): Whether to use inplace mode for activation.
+        order (tuple[str]): The order of conv/norm/activation layers. It is a
+            sequence of "conv", "norm" and "act". Examples are
+            ("conv", "norm", "act") and ("act", "conv", "norm").
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups=1,
+        bias="auto",
+        conv_cfg=None,
+        norm_cfg=None,
+        activation="ReLU",
+        inplace=True,
+        order=("conv", "norm", "act"),
+    ):
+        super(ConvModule, self).__init__()
+        assert conv_cfg is None or isinstance(conv_cfg, dict)
+        assert norm_cfg is None or isinstance(norm_cfg, dict)
+        assert activation is None or isinstance(activation, str)
+        self.conv_cfg = conv_cfg
+        self.norm_cfg = norm_cfg
+        self.activation = activation
+        self.inplace = inplace
+        self.order = order
+        assert isinstance(self.order, tuple) and len(self.order) == 3
+        assert set(order) == {"conv", "norm", "act"}
+
+        self.with_norm = norm_cfg is not None
+        # if the conv layer is before a norm layer, bias is unnecessary.
+        if bias == "auto":
+            bias = False if self.with_norm else True
+        self.with_bias = bias
+
+        if self.with_norm and self.with_bias:
+            warnings.warn("ConvModule has norm and bias at the same time")
+
+        # build convolution layer
+        self.conv = nn.Conv2d(  #
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+        # export the attributes of self.conv to a higher level for convenience
+        self.in_channels = self.conv.in_channels
+        self.out_channels = self.conv.out_channels
+        self.kernel_size = self.conv.kernel_size
+        self.stride = self.conv.stride
+        self.padding = self.conv.padding
+        self.dilation = self.conv.dilation
+        self.transposed = self.conv.transposed
+        self.output_padding = self.conv.output_padding
+        self.groups = self.conv.groups
+
+        # build normalization layers
+        if self.with_norm:
+            # norm layer is after conv layer
+            if order.index("norm") > order.index("conv"):
+                norm_channels = out_channels
+            else:
+                norm_channels = in_channels
+            self.norm_name, norm = build_norm_layer(norm_cfg, norm_channels)
+            self.add_module(self.norm_name, norm)
+        else:
+            self.norm_name = None
+
+        # build activation layer
+        if self.activation:
+            self.act = act_layers(self.activation)
+
+        # Use msra init by default
+        self.init_weights()
+
+    @property
+    def norm(self):
+        if self.norm_name:
+            return getattr(self, self.norm_name)
+        else:
+            return None
+
+    def init_weights(self):
+        if self.activation == "LeakyReLU":
+            nonlinearity = "leaky_relu"
+        else:
+            nonlinearity = "relu"
+        kaiming_init(self.conv, nonlinearity=nonlinearity)
+        if self.with_norm:
+            constant_init(self.norm, 1, bias=0)
+
+    def forward(self, x, norm=True):
+        for layer in self.order:
+            if layer == "conv":
+                x = self.conv(x)
+            elif layer == "norm" and norm and self.with_norm:
+                x = self.norm(x)
+            elif layer == "act" and self.activation:
+                x = self.act(x)
+        return x
+
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class FocalModulation(nn.Module):
+    def __init__(self, dim, focal_window, focal_level, focal_factor=2, bias=True, proj_drop=0.,
+                 use_postln_in_modulation=False, normalize_modulator=False):
+        super().__init__()
+
+        self.dim = dim
+        self.focal_window = focal_window
+        self.focal_level = focal_level
+        self.focal_factor = focal_factor
+        self.use_postln_in_modulation = use_postln_in_modulation
+        self.normalize_modulator = normalize_modulator
+
+        self.f = nn.Linear(dim, dim + (self.focal_level + 1), bias=bias)
+        self.h = nn.Conv2d(dim, dim, kernel_size=1, stride=1, bias=bias)
+
+        self.act = nn.GELU()
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.focal_layers = nn.ModuleList()
+
+        self.kernel_sizes = []
+        for k in range(self.focal_level):
+            kernel_size = self.focal_factor * k + self.focal_window
+            self.focal_layers.append(
+                nn.Sequential(
+                    nn.Conv2d(dim, dim, kernel_size=kernel_size, stride=1,
+                              groups=dim, padding=kernel_size // 2, bias=False),
+                    nn.GELU(),
+                )
+            )
+            self.kernel_sizes.append(kernel_size)
+        if self.use_postln_in_modulation:
+            self.ln = nn.LayerNorm(dim)
+
+    def forward(self, x, v):
+        """
+        Args:
+            x: input features with shape of (B, H, W, C)
+        """
+        C = x.shape[-1]
+
+        # pre linear projection
+        x = self.f(x).permute(0, 3, 1, 2).contiguous()
+        ctx, gates = torch.split(x, (C, self.focal_level + 1), 1)
+
+        # context aggreation
+        ctx_all = 0
+        for l in range(self.focal_level):
+            ctx = self.focal_layers[l](ctx)
+            ctx_all = ctx_all + ctx * gates[:, l:l + 1]
+        ctx_global = self.act(ctx.mean(2, keepdim=True).mean(3, keepdim=True))
+        ctx_all = ctx_all + ctx_global * gates[:, self.focal_level:]
+
+        # normalize context
+        if self.normalize_modulator:
+            ctx_all = ctx_all / (self.focal_level + 1)
+
+        # focal modulation
+        modulator = self.h(ctx_all)
+        x_out = v * modulator + v
+        x_out = x_out.permute(0, 2, 3, 1).contiguous()
+        if self.use_postln_in_modulation:
+            x_out = self.ln(x_out)
+
+        # post linear porjection
+        x_out = self.proj(x_out)
+        x_out = self.proj_drop(x_out)
+        return x_out
+
+
+class FocalNetBlock(nn.Module):
+    r""" Focal Modulation Network Block.
+
+    Args:
+        dim (int): Number of input channels.
+        input_resolution (tuple[int]): Input resulotion.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+        drop (float, optional): Dropout rate. Default: 0.0
+        drop_path (float, optional): Stochastic depth rate. Default: 0.0
+        act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+        focal_level (int): Number of focal levels.
+        focal_window (int): Focal window size at first focal level
+        use_layerscale (bool): Whether use layerscale
+        layerscale_value (float): Initial layerscale value
+        use_postln (bool): Whether use layernorm after modulation
+    """
+
+    def __init__(self, dim, mlp_ratio=4., drop=0., drop_path=0.,
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm,
+                 focal_level=1, focal_window=3,
+                 use_layerscale=False, layerscale_value=1e-4,
+                 use_postln=False, use_postln_in_modulation=False,
+                 normalize_modulator=False):
+        super().__init__()
+        self.dim = dim
+        # self.input_resolution = input_resolution
+        self.mlp_ratio = mlp_ratio
+
+        self.focal_window = focal_window
+        self.focal_level = focal_level
+        self.use_postln = use_postln
+
+        self.norm1 = norm_layer(dim)
+        self.modulation = FocalModulation(
+            dim, proj_drop=drop, focal_window=focal_window, focal_level=self.focal_level,
+            use_postln_in_modulation=use_postln_in_modulation, normalize_modulator=normalize_modulator
+        )
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+        self.gamma_1 = 1.0
+        self.gamma_2 = 1.0
+        if use_layerscale:
+            self.gamma_1 = nn.Parameter(layerscale_value * torch.ones((dim)), requires_grad=True)
+            self.gamma_2 = nn.Parameter(layerscale_value * torch.ones((dim)), requires_grad=True)
+
+        self.H = None
+        self.W = None
+
+    def forward(self, x, v):
+        # H, W = self.H, self.W
+        # B, L, C = x.shape
+        B, C, H, W = x.shape
+        x = x.view(B, C, H*W).permute(0, 2, 1).contiguous()
+        shortcut = x
+
+        # Focal Modulation
+        x = x if self.use_postln else self.norm1(x)
+        x = x.view(B, H, W, C)
+        x = self.modulation(x, v).view(B, H * W, C)
+        x = x if not self.use_postln else self.norm1(x)
+
+        # FFN
+        x = shortcut + self.drop_path(self.gamma_1 * x)
+        x = x + self.drop_path(self.gamma_2 * (self.norm2(self.mlp(x)) if self.use_postln else self.mlp(self.norm2(x))))
+        x = x.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+
+        return x
+
+
+class FocalPAN(nn.Module):
+    """Path Aggregation Network with Ghost block.
+
+    Args:
+        in_channels (List[int]): Number of input channels per scale.
+        out_channels (int): Number of output channels (used at each scale)
+        num_csp_blocks (int): Number of bottlenecks in CSPLayer. Default: 3
+        use_depthwise (bool): Whether to depthwise separable convolution in
+            blocks. Default: False
+        kernel_size (int): Kernel size of depthwise convolution. Default: 5.
+        expand (int): Expand ratio of GhostBottleneck. Default: 1.
+        num_blocks (int): Number of GhostBottlecneck blocks. Default: 1.
+        use_res (bool): Whether to use residual connection. Default: False.
+        num_extra_level (int): Number of extra conv layers for more feature levels.
+            Default: 0.
+        upsample_cfg (dict): Config dict for interpolate layer.
+            Default: `dict(scale_factor=2, mode='nearest')`
+        norm_cfg (dict): Config dict for normalization layer.
+            Default: dict(type='BN')
+        activation (str): Activation layer name.
+            Default: LeakyReLU.
+    """
+
+    def __init__(
+        self,
+        in_channels=[128, 256, 512],
+        out_channels=64,
+        upsample_cfg=dict(scale_factor=2, mode="bilinear"),#"bilinear"nearest
+        norm_cfg=dict(type="BN"),
+        activation="ReLU",
+    ):
+        super(FocalPAN, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.input_resolutions = [[640 // 16, 640 // 16], [640 // 32, 640 // 32]]
+        # build top-down blocks
+        self.upsample = nn.Upsample(**upsample_cfg)
+        self.reduce_layers = nn.ModuleList()
+        for idx in range(len(in_channels)):
+            self.reduce_layers.append(
+                ConvModule(
+                    in_channels[idx],
+                    out_channels,
+                    1,
+                    norm_cfg=norm_cfg,
+                    activation=activation,
+                )
+            )
+        self.top_down_blocks = nn.ModuleList()
+        # dpr = [x.item() for x in torch.linspace(0, 0.1, sum(2))]
+        for idx in range(len(in_channels) - 1, 0, -1):
+            self.top_down_blocks.append(
+                FocalNetBlock(
+                    dim=out_channels,
+                    # input_resolution=self.input_resolutions[idx],
+                    mlp_ratio=4,
+                    drop=0.,
+                    drop_path=0.,
+                    norm_layer=nn.LayerNorm,
+                    focal_level=3,
+                    focal_window=3,
+                    use_layerscale=False,
+                    layerscale_value=1e-4,
+                    use_postln=False,
+                    use_postln_in_modulation=False,
+                    normalize_modulator=True,
+                )
+            )
+
+    def forward(self, inputs):
+        """
+        Args:
+            inputs (tuple[Tensor]): input features.
+        Returns:
+            tuple[Tensor]: multi level features.
+        """
+        assert len(inputs) == len(self.in_channels)
+        inputs = [
+            reduce(input_x) for input_x, reduce in zip(inputs, self.reduce_layers)
+        ]
+        # top-down path
+        inner_outs = [inputs[-1]]
+        for idx in range(len(self.in_channels) - 1, 0, -1):
+            feat_heigh = inner_outs[0]
+            feat_low = inputs[idx - 1]
+
+            inner_outs[0] = feat_heigh
+
+            upsample_feat = self.upsample(feat_heigh)
+
+            inner_out = self.top_down_blocks[len(self.in_channels) - 1 - idx](upsample_feat, feat_low)
+            inner_outs.insert(0, inner_out)
+
+        return inner_outs
