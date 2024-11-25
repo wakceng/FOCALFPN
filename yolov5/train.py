@@ -416,7 +416,15 @@ def train(hyp, opt, device, callbacks):
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
                     loss *= 4.0
-
+            ###########################################################################################################
+            #   File "/home1/conda/env/py38/lib/python3.8/site-packages/torch/autograd/__init__.py", line 173,
+            #   in backward Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+            # RuntimeError: upsample_bilinear2d_backward_out_cuda does not have a deterministic implementation,
+            # but you set 'torch.use_deterministic_algorithms(True)'. You can turn off determinism just for
+            # this operation, or you can use the 'warn_only=True' option, if that's acceptable for your application.
+            # You can also file an issue at https://github.com/pytorch/pytorch/issues to help us prioritize adding deterministic support for this operation.
+            torch.use_deterministic_algorithms(False)
+            ###########################################################################################################
             # Backward
             scaler.scale(loss).backward()
 
